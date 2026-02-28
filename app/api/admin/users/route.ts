@@ -1,0 +1,96 @@
+import { NextRequest, NextResponse } from 'next/server'
+import { createClient } from '@supabase/supabase-js'
+
+const supabaseUrl = process.env.NEXT_PUBLIC_SUPABASE_URL!
+const supabaseServiceKey = process.env.SUPABASE_SERVICE_ROLE_KEY!
+const supabaseAdmin = createClient(supabaseUrl, supabaseServiceKey, {
+  auth: { autoRefreshToken: false, persistSession: false }
+})
+
+export async function POST(req: NextRequest) {
+  try {
+    const body = await req.json()
+    const { action, ...params } = body
+
+    // Verify the caller is an admin by checking their token
+    const authHeader = req.headers.get('authorization')
+    if (!authHeader) return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
+    
+    const token = authHeader.replace('Bearer ', '')
+    const supabaseClient = createClient(supabaseUrl, process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY!, {
+      global: { headers: { Authorization: `Bearer ${token}` } }
+    })
+    const { data: { user } } = await supabaseClient.auth.getUser()
+    if (!user) return NextResponse.json({ error: 'Unauthorized' }, { status: 401 })
+    
+    // Check admin role
+    const { data: profile } = await supabaseAdmin.from('profiles').select('role').eq('id', user.id).single()
+    if (!profile || !['admin', 'manager'].includes(profile.role)) {
+      return NextResponse.json({ error: 'Forbidden' }, { status: 403 })
+    }
+
+    switch (action) {
+      case 'create_user': {
+        const { email, password, full_name, role, dealer_id, account_id } = params
+        const { data, error } = await supabaseAdmin.auth.admin.createUser({
+          email,
+          password,
+          email_confirm: true,
+          user_metadata: { full_name, role }
+        })
+        if (error) return NextResponse.json({ error: error.message }, { status: 400 })
+        
+        // Update profile with role and links
+        if (data.user) {
+          await supabaseAdmin.from('profiles').update({
+            full_name, role,
+            dealer_id: dealer_id || null,
+            account_id: account_id || null
+          }).eq('id', data.user.id)
+        }
+        return NextResponse.json({ user: data.user })
+      }
+
+      case 'list_users': {
+        const { data, error } = await supabaseAdmin.from('profiles').select('*').order('created_at', { ascending: false })
+        if (error) return NextResponse.json({ error: error.message }, { status: 400 })
+        return NextResponse.json({ users: data })
+      }
+
+      case 'update_user': {
+        const { user_id, email, password, full_name, role, dealer_id, account_id } = params
+        
+        // Update auth user
+        const updateData: any = {}
+        if (email) updateData.email = email
+        if (password) updateData.password = password
+        if (Object.keys(updateData).length) {
+          const { error } = await supabaseAdmin.auth.admin.updateUserById(user_id, updateData)
+          if (error) return NextResponse.json({ error: error.message }, { status: 400 })
+        }
+        
+        // Update profile
+        await supabaseAdmin.from('profiles').update({
+          ...(full_name !== undefined && { full_name }),
+          ...(role !== undefined && { role }),
+          ...(dealer_id !== undefined && { dealer_id }),
+          ...(account_id !== undefined && { account_id })
+        }).eq('id', user_id)
+        
+        return NextResponse.json({ success: true })
+      }
+
+      case 'delete_user': {
+        const { user_id } = params
+        const { error } = await supabaseAdmin.auth.admin.deleteUser(user_id)
+        if (error) return NextResponse.json({ error: error.message }, { status: 400 })
+        return NextResponse.json({ success: true })
+      }
+
+      default:
+        return NextResponse.json({ error: 'Unknown action' }, { status: 400 })
+    }
+  } catch (err: any) {
+    return NextResponse.json({ error: err.message }, { status: 500 })
+  }
+}
